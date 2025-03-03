@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+
+import sys
+import torch
+from torch.utils.data import DataLoader
+
+from resnet import *
+from swiftnet import *
+from karesnet import *
+from cityscapes import CityScapes
+
+target='DPUCZDX8G_ISA1_B4096'
+device = torch.device('cuda')
+
+if len(sys.argv) == 1:
+    command = 'inspect'
+    device = torch.device('cpu')
+else:
+    command = sys.argv[1]
+
+backbone = 'KAResNet9'
+dummy_input = torch.randn([1, 3, 256, 512]).to(device)
+dataset_root = f'../{dummy_input.shape[3]}x{dummy_input.shape[2]}cityscapes'
+
+model_path = '_'.join([
+    'swiftnet',
+    backbone,
+    dataset_root[3:],
+    'nearest',
+    '128',
+    '19',
+    'best',
+    'model'
+]) + '.pt'
+
+model = torch.load(model_path, map_location=device)
+
+for name, module in model.named_modules():
+    if isinstance(module, ReLUKANConv2DLayer):
+        module.phase_low = nn.Parameter(module.phase_low.permute(0, 3, 4, 1, 2))
+        module.phase_high = nn.Parameter(module.phase_high.permute(0, 3, 4, 1, 2))
+
+model.eval()
+print(sum(p.numel() for p in model.parameters()))
+
+if str(device) == 'cuda':
+    def dev_sync():
+        torch.cuda.synchronize()
+else:
+    def dev_sync():
+        pass
+
+if command == 'inspect':
+    from pytorch_nndct import Inspector
+    inspector=Inspector(target)
+    inspector.inspect(model, (dummy_input,), device=device, output_dir=backbone+'_inspect', image_format='png')
+elif command == 'calib':
+    from pytorch_nndct.apis import torch_quantizer
+    dataset = CityScapes(dataset_root, 'test')
+    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
+
+    quantizer = torch_quantizer('calib', model, dummy_input, output_dir=backbone+'_quantize', device=device)
+    quant_model = quantizer.quant_model
+    count = 0
+    for i, _ in loader:
+        quant_model(i.to(device))
+        count += 1
+        print(f'\r{count:3d}/{len(loader)}', end='')
+    print('\n')
+    quantizer.export_quant_config()
+elif command == 'test':
+    from pytorch_nndct.apis import torch_quantizer
+    dataset = CityScapes(dataset_root, 'val')
+    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
+
+    quantizer = torch_quantizer('test', model, dummy_input, output_dir=backbone+'_quantize', device=device)
+    quantizer.quant_model(dummy_input)
+    quantizer.export_xmodel(output_dir=backbone+'_quantize')
+elif command == 'compile':
+    import os
+    os.system(' '.join([
+        'vai_c_xir',
+        '-x',
+        backbone+'_quantize/SwiftNet_int.xmodel',
+        '-a',
+        '/opt/vitis_ai/compiler/arch/DPUCZDX8G/KV260/arch.json',
+        '-o', backbone+'_compile',
+    ]))
+else:
+    from torchmetrics import JaccardIndex
+    from pytorch_nndct.apis import torch_quantizer
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    if str(device) == 'cuda':
+        dataset = CityScapes(dataset_root, 'val')
+    else:
+        dataset = CityScapes(dataset_root, 'val', 10)
+    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
+
+    if command == 'quant':
+        quantizer = torch_quantizer('test', model, dummy_input, output_dir=backbone+'_quantize', device=device)
+        model = quantizer.quant_model
+    model.eval()
+
+    metrics = JaccardIndex(
+        task='multiclass',
+        num_classes=CityScapes.num_classes,
+        ignore_index=CityScapes.num_classes,
+        average='none'
+    ).to(device)
+
+    with torch.no_grad():
+        inp = dataset[0][0].unsqueeze(0).to(device)
+        logits = model(inp)
+        dev_sync()
+
+        n = 0
+        for i, l in loader:
+            o = model(i.to(device))
+            o = torch.argmax(o, dim=1)
+            metrics.update(o, l.to(device))
+            n += 1
+            print(f'\r{n:3d}/{len(loader)}', end='')
+        mIoU = metrics.compute().mean()
+        print(f'\nmIoU: {mIoU}')
+        dev_sync()
+
+        n = 0
+        if str(device) == 'cuda':
+            activities = [ProfilerActivity.CUDA]
+        else:
+            activities = [ProfilerActivity.CPU]
+
+        with profile(activities=activities, record_shapes=False) as prof:
+            with record_function("model_inference"):
+                for inputs, _ in loader:
+                    inputs = inputs.to(device, dtype=torch.float)
+                    outputs = model(inputs)
+                    n += 1
+                    print(f'\r{n:3d}/{len(loader)}', end='')
+        if str(device) == 'cuda':
+            print('\n', prof.key_averages().table(sort_by="cuda_time_total"))
+        else:
+            print('\n', prof.key_averages().table(sort_by="cpu_time_total"))
