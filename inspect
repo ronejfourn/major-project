@@ -37,8 +37,8 @@ model = torch.load(model_path, map_location=device)
 
 for name, module in model.named_modules():
     if isinstance(module, ReLUKANConv2DLayer):
-        module.phase_low = nn.Parameter(module.phase_low.permute(0, 3, 4, 1, 2))
-        module.phase_high = nn.Parameter(module.phase_high.permute(0, 3, 4, 1, 2))
+        module.phase_low = nn.Parameter(-module.phase_low.permute(0, 3, 4, 1, 2))
+        module.phase_high = nn.Parameter(-module.phase_high.permute(0, 3, 4, 1, 2))
 
 model.eval()
 print(sum(p.numel() for p in model.parameters()))
@@ -56,7 +56,7 @@ if command == 'inspect':
     inspector.inspect(model, (dummy_input,), device=device, output_dir=backbone+'_inspect', image_format='png')
 elif command == 'calib':
     from pytorch_nndct.apis import torch_quantizer
-    dataset = CityScapes(dataset_root, 'test')
+    dataset = CityScapes(dataset_root, 'test', 500)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
 
     quantizer = torch_quantizer('calib', model, dummy_input, output_dir=backbone+'_quantize', device=device)
@@ -91,10 +91,7 @@ else:
     from pytorch_nndct.apis import torch_quantizer
     from torch.profiler import profile, record_function, ProfilerActivity
 
-    if str(device) == 'cuda':
-        dataset = CityScapes(dataset_root, 'val')
-    else:
-        dataset = CityScapes(dataset_root, 'val', 10)
+    dataset = CityScapes(dataset_root, 'val')
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
 
     if command == 'quant':
@@ -115,14 +112,15 @@ else:
         dev_sync()
 
         n = 0
-        for i, l in loader:
-            o = model(i.to(device))
-            o = torch.argmax(o, dim=1)
-            metrics.update(o, l.to(device))
-            n += 1
-            print(f'\r{n:3d}/{len(loader)}', end='')
-        mIoU = metrics.compute().mean()
-        print(f'\nmIoU: {mIoU}')
+        if str(device) == 'cuda':
+            for i, l in loader:
+                o = model(i.to(device))
+                o = torch.argmax(o, dim=1)
+                metrics.update(o, l.to(device))
+                n += 1
+                print(f'\r{n:3d}/{len(loader)}', end='')
+            mIoU = metrics.compute().mean()
+            print(f'\nmIoU: {mIoU}')
         dev_sync()
 
         n = 0
@@ -132,13 +130,13 @@ else:
             activities = [ProfilerActivity.CPU]
 
         with profile(activities=activities, record_shapes=False) as prof:
-            with record_function("model_inference"):
+            with record_function('model_inference'):
                 for inputs, _ in loader:
                     inputs = inputs.to(device, dtype=torch.float)
                     outputs = model(inputs)
                     n += 1
                     print(f'\r{n:3d}/{len(loader)}', end='')
         if str(device) == 'cuda':
-            print('\n', prof.key_averages().table(sort_by="cuda_time_total"))
+            print('\n', prof.key_averages().table(sort_by='cuda_time_total'))
         else:
-            print('\n', prof.key_averages().table(sort_by="cpu_time_total"))
+            print('\n', prof.key_averages().table(sort_by='cpu_time_total'))
