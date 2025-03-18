@@ -4,10 +4,6 @@ from torch import nn
 
 from pytorch_nndct.utils import register_custom_op
 
-@register_custom_op("subtract")
-def subtract(ctx, a, b):
-    return a - b
-
 class ReLUKANConv2DLayer(nn.Module):
     def __init__(
         self,
@@ -50,13 +46,15 @@ class ReLUKANConv2DLayer(nn.Module):
     def forward(self, x):
         basis = self.base_conv(self.base_activation(x))
 
-        x = x.permute(0, 2, 3, 1)
-        s = x.shape
-        x = x.reshape(s[0], s[1], s[2], s[3], 1)
+        # x = x.permute(0, 2, 3, 1)
+        # s = x.shape
+        # x = x.reshape(s[0], s[1], s[2], s[3], 1)
         # x = x.view(s[0], s[1], 1, s[2], s[3])
 
-        x1 = F.relu(subtract(x, self.phase_low), inplace=True)
-        x2 = F.relu(subtract(self.phase_high, x), inplace=True)
+        # x1 = F.relu(torch.sub(x, self.phase_low), inplace=True)
+        # x2 = F.relu(torch.sub(self.phase_high, x), inplace=True)
+
+        x1, x2 = self.subber(x)
         x = x1 * x2 * self.r
         x = x * x
 

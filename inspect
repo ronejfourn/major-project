@@ -4,6 +4,8 @@ import sys
 import torch
 from torch.utils.data import DataLoader
 
+import torch.nn.functional as F
+
 from resnet import *
 from swiftnet import *
 from karesnet import *
@@ -33,13 +35,48 @@ model_path = '_'.join([
     'model'
 ]) + '.pt'
 
-model = torch.load(model_path, map_location=device)
+model = torch.load(model_path, map_location=torch.device('cpu'))
+
+class PhaseSubber(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        in_features = module.phase_low.shape[1]
+
+        self.sub_low = nn.ModuleList()
+        self.sub_high = nn.ModuleList()
+
+        self.phase_low = module.phase_low
+        self.phase_high = module.phase_high
+
+        for i in range(module.g + module.k):
+            l = nn.Conv2d(in_features, in_features, 1, groups=in_features, bias=True)
+            l.weight.data.fill_(1)
+            l.bias.data = -module.phase_low[:,:,i].flatten()
+            self.sub_low.append(l)
+
+            h = nn.Conv2d(in_features, in_features, 1, groups=in_features, bias=True)
+            h.weight.data.fill_(-1)
+            h.bias.data = module.phase_high[:,:,i].flatten()
+            self.sub_high.append(h)
+
+    def forward(self, x):
+        s = x.shape
+        x1 = F.relu(torch.cat([
+            sub(x).permute(0, 2, 3, 1).reshape(s[0], s[2], s[3], s[1], 1)
+            for sub in self.sub_low
+        ], dim=4), inplace=True)
+
+        x2 = F.relu(torch.cat([
+            sub(x).permute(0, 2, 3, 1).reshape(s[0], s[2], s[3], s[1], 1)
+            for sub in self.sub_high
+        ], dim=4), inplace=True)
+        return x1, x2
 
 for name, module in model.named_modules():
     if isinstance(module, ReLUKANConv2DLayer):
-        module.phase_low = nn.Parameter(module.phase_low.permute(0, 3, 4, 1, 2))
-        module.phase_high = nn.Parameter(module.phase_high.permute(0, 3, 4, 1, 2))
+        module.subber = PhaseSubber(module)
 
+model = model.to(device)
 model.eval()
 print(sum(p.numel() for p in model.parameters()))
 
