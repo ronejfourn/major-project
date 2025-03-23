@@ -34,7 +34,6 @@ class ReLUKANConv2DLayer(nn.Module):
         phase_low = torch.arange(-k, g) / g
         phase_high = phase_low + (k + 1) / g
         phase_dims = (1, 1, 1, input_dim, k + g)
-        # phase_dims = (1, input_dim, k + g, 1, 1)
 
         self.phase_low = nn.Parameter((phase_low[None, :].expand(input_dim, -1)).view(*phase_dims), requires_grad=train_ab)
         self.phase_high = nn.Parameter((phase_high[None, :].expand(input_dim, -1)).view(*phase_dims), requires_grad=train_ab)
@@ -46,20 +45,16 @@ class ReLUKANConv2DLayer(nn.Module):
     def forward(self, x):
         basis = self.base_conv(self.base_activation(x))
 
-        # x = x.permute(0, 2, 3, 1)
-        # s = x.shape
-        # x = x.reshape(s[0], s[1], s[2], s[3], 1)
-        # x = x.view(s[0], s[1], 1, s[2], s[3])
+        x = x.permute(0, 2, 3, 1)
+        s = x.shape
+        x = x.reshape(s[0], s[1], s[2], s[3], 1)
 
-        # x1 = F.relu(torch.sub(x, self.phase_low), inplace=True)
-        # x2 = F.relu(torch.sub(self.phase_high, x), inplace=True)
-
-        x1, x2 = self.subber(x)
+        x1 = F.relu(x - self.phase_low, inplace=True)
+        x2 = F.relu(self.phase_high - x, inplace=True)
         x = x1 * x2 * self.r
         x = x * x
 
         s = x.shape
-        # x = x.view(s[0], s[1] * s[2], s[3], s[4])
         x = x.reshape(s[0], s[1], s[2], s[3] * s[4])
         x = x.permute(0, 3, 1, 2)
 

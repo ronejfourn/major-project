@@ -37,44 +37,46 @@ model_path = '_'.join([
 
 model = torch.load(model_path, map_location=torch.device('cpu'))
 
-class PhaseSubber(nn.Module):
+class ReLUKANFused(nn.Module):
     def __init__(self, module):
         super().__init__()
-        in_features = module.phase_low.shape[1]
 
-        self.sub_low = nn.ModuleList()
-        self.sub_high = nn.ModuleList()
+        self.base_conv = module.base_conv
+        self.base_act = nn.ReLU(inplace=True)
+        self.layer_norm = module.layer_norm
+        self.relukan_conv = module.relukan_conv
 
-        self.phase_low = module.phase_low
-        self.phase_high = module.phase_high
+        ch = module.phase_low.shape[1]
+        self.sub_low = nn.Conv2d(ch, ch*(module.g+module.k), 1, groups=ch, bias=True)
+        self.sub_high = nn.Conv2d(ch, ch*(module.g+module.k), 1, groups=ch, bias=True)
 
-        for i in range(module.g + module.k):
-            l = nn.Conv2d(in_features, in_features, 1, groups=in_features, bias=True)
-            l.weight.data.fill_(1)
-            l.bias.data = -module.phase_low[:,:,i].flatten()
-            self.sub_low.append(l)
+        self.sub_low.weight.data.fill_(module.r)
+        self.sub_high.weight.data.fill_(-1)
 
-            h = nn.Conv2d(in_features, in_features, 1, groups=in_features, bias=True)
-            h.weight.data.fill_(-1)
-            h.bias.data = module.phase_high[:,:,i].flatten()
-            self.sub_high.append(h)
+        self.sub_low.bias.data = -module.phase_low.flatten() * module.r
+        self.sub_high.bias.data = module.phase_high.flatten()
 
     def forward(self, x):
-        s = x.shape
-        x1 = F.relu(torch.cat([
-            sub(x).permute(0, 2, 3, 1).reshape(s[0], s[2], s[3], s[1], 1)
-            for sub in self.sub_low
-        ], dim=4), inplace=True)
+        basis = self.base_conv(self.base_act(x))
 
-        x2 = F.relu(torch.cat([
-            sub(x).permute(0, 2, 3, 1).reshape(s[0], s[2], s[3], s[1], 1)
-            for sub in self.sub_high
-        ], dim=4), inplace=True)
-        return x1, x2
+        x1 = F.relu(self.sub_low(x), inplace=True).permute(0,2,3,1)
+        x2 = F.relu(self.sub_high(x), inplace=True).permute(0,2,3,1)
 
-for name, module in model.named_modules():
-    if isinstance(module, ReLUKANConv2DLayer):
-        module.subber = PhaseSubber(module)
+        x3 = x1 * x2
+        x = x1 * x2
+        x = x * x3
+        x = x.permute(0, 3, 1, 2)
+
+        y = self.relukan_conv(x)
+        y = self.base_act(self.layer_norm(y + basis))
+        return y
+
+if backbone == 'KAResNet9':
+    model.backbone.conv1 = ReLUKANFused(model.backbone.conv1)
+    model.backbone.layer1.conv1 = ReLUKANFused(model.backbone.layer1.conv1)
+    model.backbone.layer2.conv1 = ReLUKANFused(model.backbone.layer2.conv1)
+    model.backbone.layer3.conv1 = ReLUKANFused(model.backbone.layer3.conv1)
+    model.backbone.layer4.conv1 = ReLUKANFused(model.backbone.layer4.conv1)
 
 model = model.to(device)
 model.eval()
