@@ -2,6 +2,7 @@
 
 import sys
 import torch
+import math
 from torch.utils.data import DataLoader
 
 import torch.nn.functional as F
@@ -9,7 +10,6 @@ import torch.nn.functional as F
 from resnet import *
 from swiftnet import *
 from karesnet import *
-from cityscapes import CityScapes
 
 target='DPUCZDX8G_ISA1_B4096'
 device = torch.device('cuda')
@@ -20,7 +20,7 @@ if len(sys.argv) == 1:
 else:
     command = sys.argv[1]
 
-backbone = 'KAResNet9'
+backbone = 'KAResNet9_no_square'
 dummy_input = torch.randn([1, 3, 256, 512]).to(device)
 dataset_root = f'../{dummy_input.shape[3]}x{dummy_input.shape[2]}cityscapes'
 
@@ -35,6 +35,8 @@ model_path = '_'.join([
     'model'
 ]) + '.pt'
 
+model_path = "swiftnet_no_square_g2_k1_KAResNet9_512x256cityscapes_nearest_128_19_best_model.pt"
+
 model = torch.load(model_path, map_location=torch.device('cpu'))
 
 class ReLUKANFused(nn.Module):
@@ -42,7 +44,6 @@ class ReLUKANFused(nn.Module):
         super().__init__()
 
         self.base_conv = module.base_conv
-        self.base_act = nn.ReLU(inplace=True)
         self.layer_norm = module.layer_norm
         self.relukan_conv = module.relukan_conv
 
@@ -50,28 +51,29 @@ class ReLUKANFused(nn.Module):
         self.sub_low = nn.Conv2d(ch, ch*(module.g+module.k), 1, groups=ch, bias=True)
         self.sub_high = nn.Conv2d(ch, ch*(module.g+module.k), 1, groups=ch, bias=True)
 
-        self.sub_low.weight.data.fill_(module.r)
-        self.sub_high.weight.data.fill_(-1)
+        sqrt_r = math.sqrt(module.r)
+        self.sub_low.weight.data.fill_(sqrt_r)
+        self.sub_high.weight.data.fill_(-sqrt_r)
 
-        self.sub_low.bias.data = -module.phase_low.flatten() * module.r
-        self.sub_high.bias.data = module.phase_high.flatten()
+        self.sub_low.bias.data = -module.phase_low.flatten() * sqrt_r
+        self.sub_high.bias.data = module.phase_high.flatten() * sqrt_r
 
     def forward(self, x):
-        basis = self.base_conv(self.base_act(x))
+        basis = F.relu(self.base_conv(x), inplace=True)
 
         x1 = F.relu(self.sub_low(x), inplace=True).permute(0,2,3,1)
         x2 = F.relu(self.sub_high(x), inplace=True).permute(0,2,3,1)
 
-        x3 = x1 * x2
+        # x3 = x1 * x2
         x = x1 * x2
-        x = x * x3
+        # x = x * x3
         x = x.permute(0, 3, 1, 2)
 
         y = self.relukan_conv(x)
-        y = self.base_act(self.layer_norm(y + basis))
+        y = F.relu(self.layer_norm(y + basis), inplace=True)
         return y
 
-if backbone == 'KAResNet9':
+if 'KAResNet9' in backbone:
     model.backbone.conv1 = ReLUKANFused(model.backbone.conv1)
     model.backbone.layer1.conv1 = ReLUKANFused(model.backbone.layer1.conv1)
     model.backbone.layer2.conv1 = ReLUKANFused(model.backbone.layer2.conv1)
@@ -94,8 +96,9 @@ if command == 'inspect':
     inspector=Inspector(target)
     inspector.inspect(model, (dummy_input,), device=device, output_dir=backbone+'_inspect', image_format='png')
 elif command == 'calib':
+    from cityscapes import CityScapes
     from pytorch_nndct.apis import torch_quantizer
-    dataset = CityScapes(dataset_root, 'test', 500)
+    dataset = CityScapes(dataset_root, 'val')
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
 
     quantizer = torch_quantizer('calib', model, dummy_input, output_dir=backbone+'_quantize', device=device)
@@ -108,6 +111,7 @@ elif command == 'calib':
     print('\n')
     quantizer.export_quant_config()
 elif command == 'test':
+    from cityscapes import CityScapes
     from pytorch_nndct.apis import torch_quantizer
     dataset = CityScapes(dataset_root, 'val')
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
@@ -125,7 +129,67 @@ elif command == 'compile':
         '/opt/vitis_ai/compiler/arch/DPUCZDX8G/KV260/arch.json',
         '-o', backbone+'_compile',
     ]))
+elif command == 'vis':
+  from cityscapes import CityScapes
+  c_inputs = []
+  c_labels = []
+  c_preds = []
+
+  test_data = CityScapes(dataset_root, 'test')
+  test_loader = DataLoader(test_data, batch_size=1, num_workers=2)
+
+  for i, l in test_loader:
+    i, l = i.to(device, dtype=torch.float32), l.to(device)
+    with torch.no_grad():
+      o = model(i)
+    # e = evaluate(o.cpu(), l.cpu())
+
+    for j in range(o.shape[0]):
+      c_preds.append(o[j].cpu())
+      c_inputs.append(i[j].cpu())
+      c_labels.append(l[j].cpu())
+    break
+
+  import matplotlib.pyplot as plt
+
+  def colorize(labels):
+    x = CityScapes.train_id_to_id[labels]
+    x = CityScapes.id_to_color[x]
+    colors = np.array(colors)
+    return colors[labels]
+
+  def visualize(images, gt, preds, rows):
+      fig, axs = plt.subplots(rows, 3, figsize=(10,20))
+
+      axs[0].set_title('Original Image')
+      axs[1].set_title('Overlay')
+      axs[2].set_title('Predicted')
+
+      for ax in axs.flat:
+          ax.axis('off')
+
+      print(rows)
+      for i in range(rows):
+        image_np = images[i].numpy().transpose(1, 2, 0)
+
+        gt_indices = gt[i].numpy()
+        pred_indices = torch.argmax(preds[i], dim=0).numpy()
+
+        colored_gts = CityScapes.train_id_to_color[gt_indices]
+        colored_preds = [CityScapes.train_id_to_color[i] for i in pred_indices]
+
+        axs[0].imshow(image_np)
+        axs[1].imshow(image_np)
+        axs[1].imshow(colored_preds, alpha=0.5)
+        axs[2].imshow(colored_preds)
+
+      plt.tight_layout()
+      plt.savefig('asdf.png')
+      print('ok')
+
+  visualize(c_inputs, c_labels, c_preds, min(len(c_inputs), 10))
 else:
+    from cityscapes import CityScapes
     from torchmetrics import JaccardIndex
     from pytorch_nndct.apis import torch_quantizer
     from torch.profiler import profile, record_function, ProfilerActivity
@@ -162,20 +226,20 @@ else:
             print(f'\nmIoU: {mIoU}')
         dev_sync()
 
-        n = 0
-        if str(device) == 'cuda':
-            activities = [ProfilerActivity.CUDA]
-        else:
-            activities = [ProfilerActivity.CPU]
-
-        with profile(activities=activities, record_shapes=False) as prof:
-            with record_function('model_inference'):
-                for inputs, _ in loader:
-                    inputs = inputs.to(device, dtype=torch.float)
-                    outputs = model(inputs)
-                    n += 1
-                    print(f'\r{n:3d}/{len(loader)}', end='')
-        if str(device) == 'cuda':
-            print('\n', prof.key_averages().table(sort_by='cuda_time_total'))
-        else:
-            print('\n', prof.key_averages().table(sort_by='cpu_time_total'))
+        # n = 0
+        # if str(device) == 'cuda':
+        #     activities = [ProfilerActivity.CUDA]
+        # else:
+        #     activities = [ProfilerActivity.CPU]
+        #
+        # with profile(activities=activities, record_shapes=False) as prof:
+        #     with record_function('model_inference'):
+        #         for inputs, _ in loader:
+        #             inputs = inputs.to(device, dtype=torch.float)
+        #             outputs = model(inputs)
+        #             n += 1
+        #             print(f'\r{n:3d}/{len(loader)}', end='')
+        # if str(device) == 'cuda':
+        #     print('\n', prof.key_averages().table(sort_by='cuda_time_total'))
+        # else:
+        #     print('\n', prof.key_averages().table(sort_by='cpu_time_total'))
