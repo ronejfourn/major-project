@@ -54,7 +54,12 @@ while cap.isOpened():
     overlay = cv2.addWeighted(frame, 0.6, color_mask, 0.4, 0)
 
     out.write(overlay)
-    cv2.imshow("Segmentation", overlay)
+
+    cv2.imshow("Original Video", frame)
+    cv2.imshow("Segmentation Output", overlay)
+    cv2.moveWindow("Original Video", 100, 100)
+    cv2.moveWindow("Segmented Output", 800, 100)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
